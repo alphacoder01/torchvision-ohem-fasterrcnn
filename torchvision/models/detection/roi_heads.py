@@ -1,3 +1,4 @@
+from multiprocessing import reduction
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -9,44 +10,59 @@ from torchvision.ops import boxes as box_ops, roi_align
 from . import _utils as det_utils
 
 
-def fastrcnn_loss(class_logits, box_regression, labels, regression_targets):
-    # type: (Tensor, Tensor, List[Tensor], List[Tensor]) -> Tuple[Tensor, Tensor]
-    """
-    Computes the loss for Faster R-CNN.
+class OHEM(nn.Module):
+  def __init__(self, losses, ratio):
+    super(OHEM, self).__init__()
+    self.ratio = ratio
+    self.losses = losses
 
-    Args:
-        class_logits (Tensor)
-        box_regression (Tensor)
-        labels (list[BoxList])
-        regression_targets (Tensor)
 
-    Returns:
-        classification_loss (Tensor)
-        box_loss (Tensor)
-    """
+  def hard_mining(self, output, labels):
+    num_inst =  output.size(0)
+    num_hard = max(int(self.ratio * num_inst), 1)
 
+    _, idcs = torch.topk(output, min(num_hard, len(output)))
+    return idcs
+
+  
+  def forward(self, class_logits, box_regression, cls_labels, regression_targets):
     labels = torch.cat(labels, dim=0)
     regression_targets = torch.cat(regression_targets, dim=0)
 
-    classification_loss = F.cross_entropy(class_logits, labels)
+    c = 0
+    loss_val = []
+    for iter in zip([[class_logits,cls_labels], [box_regression,regression_targets]]):
+      outputs, labels = iter[0]
+      #separate +ve and -ve labelled samples 
+      pos_indxs = labels[:, 0] >= 0.5
+      neg_indxs = labels[:, 0] < 0.5
 
-    # get indices that correspond to the regression targets for
-    # the corresponding ground truth labels, to be used with
-    # advanced indexing
-    sampled_pos_inds_subset = torch.where(labels > 0)[0]
-    labels_pos = labels[sampled_pos_inds_subset]
-    N, num_classes = class_logits.shape
-    box_regression = box_regression.reshape(N, box_regression.size(-1) // 4, 4)
+      pos_output = class_logits[pos_indxs]
+      pos_labels = labels[neg_indxs]
+      neg_output = class_logits[:, 0][neg_indxs]
+      neg_labels = labels[:, 0][neg_indxs]
 
-    box_loss = F.smooth_l1_loss(
-        box_regression[sampled_pos_inds_subset, labels_pos],
-        regression_targets[sampled_pos_inds_subset],
-        beta=1 / 9,
-        reduction="sum",
-    )
-    box_loss = box_loss / labels.numel()
+      #mine hard samples for both classes
+      mined_idcs_pos = self.hard_mining(pos_output, pos_labels)
+      mined_idcs_neg = self.hard_mining(neg_output, neg_labels)
 
-    return classification_loss, box_loss
+      loss = self.losses[c]
+      neg_pred = torch.index_select(neg_output, 0, mined_idcs_neg)
+      neg_target = torch.index_select(neg_labels, 0, mined_idcs_neg)
+
+      pos_pred = torch.index_select(pos_output, 0, mined_idcs_pos)
+      pos_target = torch.index_select(pos_labels, 0, mined_idcs_pos)
+
+      pos_loss = loss(pos_pred, pos_target)
+      neg_loss = loss(neg_pred, neg_target)
+
+      loss = 0.5*pos_loss + 0.5*neg_loss
+      if c==0:
+        loss_val.append(torch.mean(loss))
+      else:
+        loss_val.append(loss/labels.numel())
+
+    return loss_val[0], loss_val[1]
 
 
 def maskrcnn_inference(x, labels):
@@ -518,8 +534,12 @@ class RoIHeads(nn.Module):
         keypoint_roi_pool=None,
         keypoint_head=None,
         keypoint_predictor=None,
+        loss_1 = nn.CrossEntropy(),
+        loss_2 = nn.MSELoss(reduction='sum')
     ):
         super().__init__()
+
+        self.ashish_loss = OHEM([loss_1,loss_2], ratio=0.5)
 
         self.box_similarity = box_ops.box_iou
         # assign ground-truth boxes for each proposal
@@ -546,6 +566,7 @@ class RoIHeads(nn.Module):
         self.keypoint_roi_pool = keypoint_roi_pool
         self.keypoint_head = keypoint_head
         self.keypoint_predictor = keypoint_predictor
+        self.ashish_loss = OHEM([])
 
     def has_mask(self):
         if self.mask_roi_pool is None:
@@ -769,7 +790,7 @@ class RoIHeads(nn.Module):
                 raise ValueError("labels cannot be None")
             if regression_targets is None:
                 raise ValueError("regression_targets cannot be None")
-            loss_classifier, loss_box_reg = fastrcnn_loss(class_logits, box_regression, labels, regression_targets)
+            loss_classifier, loss_box_reg = self.ashish_loss(class_logits, box_regression, labels, regression_targets)
             losses = {"loss_classifier": loss_classifier, "loss_box_reg": loss_box_reg}
         else:
             boxes, scores, labels = self.postprocess_detections(class_logits, box_regression, proposals, image_shapes)
