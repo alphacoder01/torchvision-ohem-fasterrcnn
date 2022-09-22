@@ -566,7 +566,6 @@ class RoIHeads(nn.Module):
         self.keypoint_roi_pool = keypoint_roi_pool
         self.keypoint_head = keypoint_head
         self.keypoint_predictor = keypoint_predictor
-        self.ashish_loss = OHEM([])
 
     def has_mask(self):
         if self.mask_roi_pool is None:
