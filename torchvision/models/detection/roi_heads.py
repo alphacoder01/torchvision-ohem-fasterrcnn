@@ -534,7 +534,7 @@ class RoIHeads(nn.Module):
         keypoint_roi_pool=None,
         keypoint_head=None,
         keypoint_predictor=None,
-        loss_1 = nn.CrossEntropy(),
+        loss_1 = nn.CrossEntropyLoss(),
         loss_2 = nn.MSELoss(reduction='sum')
     ):
         super().__init__()
